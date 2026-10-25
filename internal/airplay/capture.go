@@ -28,7 +28,7 @@ import (
 type CaptureConfig struct {
 	FPS        int
 	Bitrate    int        // Video bitrate in kbps (0 = auto)
-	HWAccel    string     // "auto", "nvenc", "vaapi", "openh264", or "none"
+	HWAccel    string     // "auto", "nvenc", "amf", "vaapi", "openh264", or "none"
 	VideoCodec VideoCodec // empty/h264, auto (resolved before Start), or hevc
 
 	// MaxWidth/MaxHeight select the encoded canvas advertised by the receiver.
@@ -66,10 +66,10 @@ func ValidateWaylandSource(source string) error {
 // zero-value CaptureConfig useful and is treated as auto.
 func ValidateHWAccel(method string) error {
 	switch method {
-	case "", "auto", "nvenc", "vaapi", "openh264", "none":
+	case "", "auto", "nvenc", "amf", "vaapi", "openh264", "none":
 		return nil
 	default:
-		return fmt.Errorf("unknown encoder %q (want auto, nvenc, vaapi, openh264, or none)", method)
+		return fmt.Errorf("unknown encoder %q (want auto, nvenc, amf, vaapi, openh264, or none)", method)
 	}
 }
 
@@ -275,8 +275,8 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 		timestampedOutput: supportsTimestampedVideoOutput(normalizeVideoCodec(validationCfg.VideoCodec)),
 	}
 	if cfg.VideoCodec == VideoCodecHEVC {
-		// Forced NVENC HEVC uses the same local pipeline and benefits from the
-		// same scheduling calibration. Explicit software x265 remains a deliberate
+		// Forced hardware HEVC (NVENC or AMF) uses the same local pipeline and
+		// benefits from the same scheduling calibration. Explicit software x265 remains a deliberate
 		// opt-in and can be tuned with the joint latency override.
 		_, preparation.measuredVideoLatency = automaticHEVCProfile(cfg.HWAccel, cfg.FPS)
 	}
@@ -584,18 +584,33 @@ func supportsTimestampedVideoOutputWithProbe(codec VideoCodec, hasElement func(s
 // path; merely finding x265 is not enough to make 4K software encoding the
 // normal default.
 func automaticHEVCAvailableWithProbe(hwaccel string, hasElement func(string) bool) bool {
+	return automaticHEVCMethod(hwaccel, hasElement) != ""
+}
+
+// automaticHEVCMethod returns the hardware HEVC method that the high-resolution
+// path would run, or "" when no hardware encoder with the full timestamped
+// output stack is available.
+func automaticHEVCMethod(hwaccel string, hasElement func(string) bool) string {
+	method := hardwareHEVCMethod(hwaccel, hasElement)
+	if method == "" || !hasElement("h265parse") || !supportsTimestampedVideoOutputWithProbe(VideoCodecHEVC, hasElement) {
+		return ""
+	}
+	return method
+}
+
+var hardwareHEVCMethods = map[string]string{"nvh265enc": "nvenc", "amfh265enc": "amf"}
+
+// hardwareHEVCMethod resolves -hwaccel through selectGstHEVCEncoder, so the
+// calibration probe always measures the encoder that Start will run.
+func hardwareHEVCMethod(hwaccel string, hasElement func(string) bool) string {
 	if hwaccel == "" {
 		hwaccel = "auto"
 	}
-	if hwaccel != "auto" && hwaccel != "nvenc" {
-		return false
+	encoder, err := selectGstHEVCEncoder(CaptureConfig{}, hasElement, false, hwaccel, defaultVideoBitrateKbps, 1)
+	if err != nil || len(encoder.parts) == 0 {
+		return ""
 	}
-	for _, element := range []string{"nvh265enc", "h265parse"} {
-		if !hasElement(element) {
-			return false
-		}
-	}
-	return supportsTimestampedVideoOutputWithProbe(VideoCodecHEVC, hasElement)
+	return hardwareHEVCMethods[encoder.parts[0]]
 }
 
 type automaticHEVCProbeResult struct {
@@ -604,7 +619,12 @@ type automaticHEVCProbeResult struct {
 	lead time.Duration
 }
 
-var automaticHEVCProbeResults sync.Map // map[int]*automaticHEVCProbeResult, keyed by FPS
+type automaticHEVCProbeKey struct {
+	method string
+	fps    int
+}
+
+var automaticHEVCProbeResults sync.Map // map[automaticHEVCProbeKey]*automaticHEVCProbeResult
 
 const (
 	automaticHEVCProbeFrames       = 45
@@ -748,7 +768,7 @@ func MeasureVideoCaptureLatency(ctx context.Context, capture *ScreenCapture, fps
 	}
 }
 
-func probeAutomaticHEVC(fps int) (bool, time.Duration) {
+func probeAutomaticHEVC(method string, fps int) (bool, time.Duration) {
 	if fps <= 0 {
 		fps = 30
 	}
@@ -757,7 +777,7 @@ func probeAutomaticHEVC(fps int) (bool, time.Duration) {
 	cfg := CaptureConfig{
 		FPS:        fps,
 		Bitrate:    maxVideoBitrateKbps,
-		HWAccel:    "nvenc",
+		HWAccel:    method,
 		VideoCodec: VideoCodecHEVC,
 		MaxWidth:   3840,
 		MaxHeight:  2160,
@@ -785,23 +805,25 @@ func probeAutomaticHEVC(fps int) (bool, time.Duration) {
 }
 
 func automaticHEVCProfile(hwaccel string, fps int) (bool, time.Duration) {
-	if !automaticHEVCAvailableWithProbe(hwaccel, hasGstElement) {
+	method := automaticHEVCMethod(hwaccel, hasGstElement)
+	if method == "" {
 		return false, 0
 	}
 	if fps <= 0 {
 		fps = 30
 	}
-	value, _ := automaticHEVCProbeResults.LoadOrStore(fps, &automaticHEVCProbeResult{})
+	value, _ := automaticHEVCProbeResults.LoadOrStore(automaticHEVCProbeKey{method, fps}, &automaticHEVCProbeResult{})
 	result := value.(*automaticHEVCProbeResult)
 	result.once.Do(func() {
-		// Factory presence alone does not prove that the installed NVIDIA stack
-		// can sustain timestamped 4K HEVC Main within a useful presentation budget.
-		// Exercise the actual capture suffix and retain its source-to-AU p95.
-		result.ok, result.lead = probeAutomaticHEVC(fps)
+		// Factory presence alone does not prove that the installed hardware
+		// encoder stack can sustain timestamped 4K HEVC Main within a useful
+		// presentation budget. Exercise the actual capture suffix and retain
+		// its source-to-AU p95.
+		result.ok, result.lead = probeAutomaticHEVC(method, fps)
 		if result.ok {
-			dbg("[CAPTURE] automatic HEVC 4K Main %dfps probe passed (minimum video lead %v)", fps, result.lead)
+			dbg("[CAPTURE] automatic HEVC 4K Main %s %dfps probe passed (minimum video lead %v)", method, fps, result.lead)
 		} else {
-			dbg("[CAPTURE] automatic HEVC %dfps hardware probe failed; retaining H.264", fps)
+			dbg("[CAPTURE] automatic HEVC %s %dfps hardware probe failed; retaining H.264", method, fps)
 		}
 	})
 	return result.ok, result.lead
@@ -2126,6 +2148,22 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 			}},
 		},
 		{
+			method:  "amf",
+			element: "amfh264enc",
+			label:   "AMF hardware encoding (amfh264enc)",
+			result: encoderResult{rawFormat: "NV12", codec: VideoCodecH264, parts: []string{
+				"amfh264enc",
+				"usage=low-latency",
+				"b-frames=0",
+				"rate-control=cbr",
+				"preset=balanced",
+				fmt.Sprintf("bitrate=%d", bitrate),
+				fmt.Sprintf("max-bitrate=%d", maxrate),
+				fmt.Sprintf("gop-size=%d", keyframeInterval),
+				"aud=true",
+			}},
+		},
+		{
 			method:  "vaapi",
 			element: "vah264enc",
 			label:   "VAAPI hardware encoding (vah264enc)",
@@ -2216,6 +2254,16 @@ func selectGstHEVCEncoder(cfg CaptureConfig, hasElement func(string) bool, annou
 			}},
 		},
 		{
+			// AMD VCN through AMF. Low-latency usage disables B-frames, and CBR
+			// keeps the receiver's playout buffer depth predictable.
+			method: "amf", element: "amfh265enc", label: "AMF HEVC Main hardware encoding (amfh265enc)",
+			result: encoderResult{codec: VideoCodecHEVC, rawFormat: "NV12", parts: gstStage{
+				"amfh265enc", "usage=low-latency", "rate-control=cbr", "preset=balanced",
+				fmt.Sprintf("bitrate=%d", bitrate), fmt.Sprintf("max-bitrate=%d", bitrate+bitrate/4),
+				fmt.Sprintf("gop-size=%d", keyframeInterval), "aud=true",
+			}},
+		},
+		{
 			method: "none", element: "x265enc", label: "x265 HEVC Main software encoding (x265enc)",
 			result: encoderResult{codec: VideoCodecHEVC, rawFormat: "I420", parts: gstStage{
 				"x265enc", fmt.Sprintf("bitrate=%d", bitrate), fmt.Sprintf("key-int-max=%d", keyframeInterval),
@@ -2235,9 +2283,9 @@ func selectGstHEVCEncoder(cfg CaptureConfig, hasElement func(string) bool, annou
 		}
 	}
 	if hwaccel == "auto" {
-		return encoderResult{}, fmt.Errorf("HEVC requires GStreamer nvh265enc or x265enc; neither is available")
+		return encoderResult{}, fmt.Errorf("HEVC requires GStreamer nvh265enc, amfh265enc or x265enc; none is available")
 	}
-	return encoderResult{}, fmt.Errorf("-video-codec hevc is unavailable with -hwaccel %s (use nvenc or none)", hwaccel)
+	return encoderResult{}, fmt.Errorf("-video-codec hevc is unavailable with -hwaccel %s (use nvenc, amf or none)", hwaccel)
 }
 
 // StartTestCapture creates a synthetic stream with the configured encoder.
