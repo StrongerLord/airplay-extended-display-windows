@@ -114,6 +114,32 @@ func TestAutomaticHEVCAvailabilityRequiresHardwareAndFullTimestampStack(t *testi
 	}
 }
 
+func TestAutomaticHEVCAvailabilityAcceptsAMF(t *testing.T) {
+	elements := map[string]bool{
+		"amfh265enc":        true,
+		"h265parse":         true,
+		"rtph265pay":        true,
+		"rtponviftimestamp": true,
+		"rtpstreampay":      true,
+	}
+	probe := func(name string) bool { return elements[name] }
+	for _, hwaccel := range []string{"", "auto", "amf"} {
+		if !automaticHEVCAvailableWithProbe(hwaccel, probe) {
+			t.Errorf("automatic HEVC unavailable for hwaccel %q with AMF stack", hwaccel)
+		}
+	}
+	if automaticHEVCAvailableWithProbe("nvenc", probe) {
+		t.Error("automatic HEVC accepted nvenc without nvh265enc")
+	}
+	if got := hardwareHEVCMethod("auto", probe); got != "amf" {
+		t.Errorf("hardwareHEVCMethod(auto) = %q, want amf", got)
+	}
+	elements["nvh265enc"] = true
+	if got := hardwareHEVCMethod("auto", probe); got != "nvenc" {
+		t.Errorf("hardwareHEVCMethod(auto) with both encoders = %q, want nvenc", got)
+	}
+}
+
 func TestRecommendedAutomaticVideoLatencyUsesP95AndDeliveryMargin(t *testing.T) {
 	if _, ok := recommendedAutomaticVideoLatency(nil, 30); ok {
 		t.Fatal("empty latency sample set was accepted")
@@ -287,7 +313,7 @@ func TestStartGStreamerCommandSetsParentDeathSignal(t *testing.T) {
 }
 
 func TestValidateHWAccel(t *testing.T) {
-	for _, method := range []string{"", "auto", "nvenc", "vaapi", "openh264", "none"} {
+	for _, method := range []string{"", "auto", "nvenc", "amf", "vaapi", "openh264", "none"} {
 		if err := ValidateHWAccel(method); err != nil {
 			t.Errorf("ValidateHWAccel(%q): %v", method, err)
 		}
@@ -552,6 +578,7 @@ func TestSelectGstHEVCEncoderUsesMainProfileInput(t *testing.T) {
 		rawFormat string
 	}{
 		{name: "NVENC", hwaccel: "nvenc", element: "nvh265enc", rawFormat: "NV12"},
+		{name: "AMF", hwaccel: "amf", element: "amfh265enc", rawFormat: "NV12"},
 		{name: "x265", hwaccel: "none", element: "x265enc", rawFormat: "I420"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -799,7 +826,7 @@ func TestDetectGstEncoderRejectsMissingExplicitOpenH264(t *testing.T) {
 }
 
 func TestDetectGstEncoderSelectionContract(t *testing.T) {
-	allProbes := []string{"vulkanh264enc", "nvh264enc", "vah264enc", "openh264enc", "x264enc"}
+	allProbes := []string{"vulkanh264enc", "nvh264enc", "amfh264enc", "vah264enc", "openh264enc", "x264enc"}
 	tests := []struct {
 		name        string
 		method      string
@@ -814,7 +841,7 @@ func TestDetectGstEncoderSelectionContract(t *testing.T) {
 			method:      "auto",
 			available:   map[string]bool{"openh264enc": true, "x264enc": true},
 			wantEncoder: "openh264enc",
-			wantProbes:  allProbes[:4],
+			wantProbes:  allProbes[:5],
 		},
 		{
 			name:        "empty aliases auto and reaches x264",
@@ -841,6 +868,20 @@ func TestDetectGstEncoderSelectionContract(t *testing.T) {
 			available:  map[string]bool{"vah264enc": true, "openh264enc": true, "x264enc": true},
 			wantProbes: []string{"vulkanh264enc", "nvh264enc"},
 			wantError:  "-hwaccel nvenc",
+		},
+		{
+			name:        "amf selects only AMF",
+			method:      "amf",
+			available:   map[string]bool{"amfh264enc": true, "openh264enc": true},
+			wantEncoder: "amfh264enc",
+			wantProbes:  []string{"amfh264enc"},
+		},
+		{
+			name:       "missing amf does not cross fallback",
+			method:     "amf",
+			available:  map[string]bool{"openh264enc": true, "x264enc": true},
+			wantProbes: []string{"amfh264enc"},
+			wantError:  "amfh264enc",
 		},
 		{
 			name:        "vaapi selects only VAAPI",

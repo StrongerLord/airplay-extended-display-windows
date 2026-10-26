@@ -69,6 +69,26 @@ Edit the settings block at the top of `Start-TV-Display.cmd`:
 | `FPS` | `30` | 60 is possible with a fast CPU |
 | `AUDIO_TO_TV_ONLY` | `1` | `0` keeps sound on the PC too |
 
+## 4K mode (hardware HEVC)
+
+`windows\Start-TV-4K.cmd` makes the TV a separate **3840x2160** display and streams it with
+hardware HEVC: `-hwaccel amf` on AMD GPUs (`amfh265enc`), `nvenc` on NVIDIA. The virtual display
+is SDR, so an HDR desktop on your main monitor does not wash out the picture on the TV.
+
+```bat
+windows\Start-TV-4K.cmd -TvIp 192.168.1.50 -HwAccel amf
+```
+
+Parameters (top of `Start-TV-4K.ps1`): `-TvIp` (empty = auto-discover), `-Width`, `-Height`,
+`-Fps` (30), `-BitrateKbps` (25000), `-LatencyMs` (500), `-HwAccel` (auto), `-MutePc` ($true).
+
+- Sound stays in sync with the picture: the HEVC latency calibration now runs for AMF too.
+- With `-MutePc` the PC speakers are muted while streaming (WASAPI loopback still captures
+  them, so the TV keeps the sound) and unmuted afterwards. The same device is restored even if
+  the default output changes, and a session that was killed is undone on the next start.
+- Closing the window or Ctrl+C both clean up: a hidden guard process restores the speakers and
+  removes the virtual display. Only one session runs at a time.
+
 ## Troubleshooting
 
 - **Choppy audio** → raise `LATENCY_MS` and lower `BITRATE_KBPS`. With 15 Mbps and the
@@ -79,8 +99,8 @@ Edit the settings block at the top of `Start-TV-Display.cmd`:
   name `ParsecVDA` in `gst-device-monitor-1.0 Source/Monitor`. Run that command to check the order.
 - **"pipewiresrc plugin not found" on Windows** → you are running an unpatched upstream
   build. This repository fixes it.
-- **Encoding is done on the CPU (x264).** Only NVIDIA hardware encoding is wired in upstream;
-  AMD/Intel GPUs fall back to x264. A modern 8-core CPU handles 1080p30 easily.
+- **Encoding is done on the CPU (x264).** Hardware encoding is wired for NVIDIA (`nvenc`) and
+  AMD (`amf`); Intel GPUs fall back to x264. A modern 8-core CPU handles 1080p30 easily.
 
 ## Limitations
 
